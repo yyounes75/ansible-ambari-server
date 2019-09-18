@@ -1,0 +1,114 @@
+---
+- name: Install ambari
+  yum: name={{item}} state=installed
+  with_items:
+    - ambari-server
+    - ambari-agent
+    - wget
+
+- name: MySQL
+  block:
+    - name: MySQL - Install MySQL packages
+      yum: name={{item}} state=installed
+      with_items:
+        - mysql-connector-java
+        - mysql
+
+    - name: MySQL - Check if the database exists
+      shell: mysql -u {{ ambari_database_user }} -p'{{ ambari_database_user_password }}' -e 'USE {{ ambari_database }}; SHOW TABLES;'
+      register: checkdbambari
+
+    - name: MySQL - Import ambari database
+      mysql_db:
+        state: import
+        name: '{{ ambari_database }}'
+        login_user: "{{ ambari_database_user }}"
+        login_password: "{{ ambari_database_user_password }}"
+        target: /var/lib/ambari-server/resources/Ambari-DDL-MySQL-CREATE.sql
+      ignore_errors: True
+      when: checkdbambari.stdout.find("stack") == -1
+
+    - name: Set JDBC Driver path
+      set_fact:
+        jdbc_driver: "{{ mysql_jdbc_driver }}"
+    
+    - name: Set database type
+      set_fact:
+        database: "mysql"
+
+  when: database_type | lower == "mysql"
+
+- name: PostgreSQL
+  block:
+    - name: PostgreSQL - Install PostgreSQL packages
+      yum: name={{item}} state=installed
+      with_items:
+        - postgresql-jdbc
+
+    # - name: PostgreSQL - Check if the database exists
+    #   shell: PostgreSQL -u {{ ambari_database_user }} -p'{{ ambari_database_user_password }}' -e 'USE {{ ambari_database }}; SHOW TABLES;'
+    #   register: checkdbambari
+
+    - name: PostgreSQL - Import ambari database
+      become: true
+      become_user: postgres
+      postgresql_db:
+        state: restore
+        name: '{{ ambari_database }}'
+        target: /var/lib/ambari-server/resources/Ambari-DDL-Postgres-CREATE.sql
+      ignore_errors: True
+      # when: checkdbambari.stdout.find("stack") == -1
+    
+    - name: Set JDBC Driver path
+      set_fact:
+        jdbc_driver: "{{ postgresql_jdbc_driver }}"
+    
+    - name: Set database type
+      set_fact:
+        database: "postgres"
+
+  when: database_type | lower == "postgresql"
+
+- name: Ambari-server - Setup
+  shell: 'ambari-server setup --silent --database={{ database }} --databasename={{ ambari_database }} --databaseusername={{ ambari_database_user }} --databasepassword={{ ambari_database_user_password }} --databasehost={{ database_server_hostname }} --databaseport={{ database_server_port }} --java-home=/usr/java/default'
+- name: Ambari-server - Encrypt password
+  shell: 'ambari-server setup --silent --jdbc-db={{ database }} --jdbc-driver={{ jdbc_driver }} && ambari-server setup-security --security-option=encrypt-passwords --master-key={{ ambari_master_key }} --master-key-persist=true'
+- name: Ambari-server - SSL
+  shell: 'ambari-server setup-security --security-option=setup-https --api-ssl=true --api-ssl-port={{ ambari_ssl_port }} --pem-password= --import-cert-path="{{ ssl_cert_folder }}/{{ inventory_hostname }}.cert.pem" --import-key-path="{{ ssl_cert_folder }}/{{ inventory_hostname }}.key.pem"'
+  when: ambari_ssl == True
+- name: Ambari-server - SSL
+  shell: 'ambari-server setup-security --security-option=setup-truststore --truststore-path={{ ssl_stores_path }}/truststore.jks --truststore-type=jks --truststore-password={{ truststore_password }} --truststore-reconfigure'
+  when: ambari_ssl == True
+
+- name: CentOS > 7.0
+  block:
+    - name: Copy systemd service for ambari-server
+      template:
+        src: ambari-server.service
+        dest: /lib/systemd/system/ambari-server.service
+    - name: Systemd reload
+      systemd: daemon_reload=yes
+    - name: Disable chkconfig
+      command: chkconfig ambari-server off
+    - name: Enale service Ambari-server
+      systemd:
+        enabled: yes
+        masked: no
+        name: ambari-server.service
+    - name: Restart service Ambari-server
+      systemd:
+        state: restarted
+        name: ambari-server
+  when: ansible_distribution == 'CentOS' and ansible_distribution_version >= '7'
+
+- name: CentOS < 7.0
+  block:
+    - name: Enale service Ambari-server
+      service:
+        enabled: yes
+        name: ambari-server
+    - name: Restart service Ambari-server
+      service:
+        state: restarted
+        name: ambari-server
+  when: ansible_distribution == 'CentOS' and ansible_distribution_version < '7'
